@@ -113,6 +113,13 @@ class CSEPass(Pass):
         self._loads_eliminated = 0
         # Use-def context for efficient replacements
         self._use_def_ctx: Optional[UseDefContext] = None
+        # Hash-consing table: shallow (opcode, operand-tokens[, epoch]) key ->
+        # compact ("id", n) token. Prevents value-number keys from nesting
+        # the full recursive structure of every ancestor expression (which
+        # would make key size, and thus hash/compare cost, grow with
+        # program length -- O(n) per lookup, O(n^2) overall for long chains).
+        self._vn_interner: dict[tuple, tuple] = {}
+        self._next_vn_id = 0
 
     @property
     def name(self) -> str:
@@ -124,6 +131,8 @@ class CSEPass(Pass):
         self._expressions_analyzed = 0
         self._expressions_eliminated = 0
         self._loads_eliminated = 0
+        self._vn_interner = {}
+        self._next_vn_id = 0
 
         # Check if pass is enabled
         if not config.enabled:
@@ -300,13 +309,26 @@ class CSEPass(Pass):
             results=if_stmt.results
         )
 
+    def _intern(self, shallow_key: tuple) -> tuple:
+        """Hash-cons a shallow (opcode, operand-tokens[, epoch]) key to a
+        compact ("id", n) token, so operand tokens never grow with the
+        depth of the expression DAG (see comment on self._vn_interner)."""
+        token = self._vn_interner.get(shallow_key)
+        if token is None:
+            token = ("id", self._next_vn_id)
+            self._next_vn_id += 1
+            self._vn_interner[shallow_key] = token
+        return token
+
     def _make_value_number_key(self, op: Op, ctx: CSEContext) -> Optional[tuple]:
         """
         Compute the value number key for an operation.
 
         Returns None if we can't compute a value number (e.g., unknown operand).
         """
-        # For other ops, use opcode + operand value numbers
+        # For other ops, use opcode + operand value-number tokens. Each
+        # token is O(1)-sized (a compact ("id", n)/("const", v)/("ssa", id)
+        # tuple), never the operand's own full nested key.
         operand_vns = []
         for operand in op.operands:
             vn = self._get_operand_value_number(operand, ctx)
@@ -323,9 +345,11 @@ class CSEPass(Pass):
         # Include memory epoch for load operations
         # This enables loads with same address but different epochs to have different value numbers
         if op.opcode in LOAD_OPS:
-            return (op.opcode, tuple(operand_vns), ctx.get_mem_epoch())
+            shallow_key = (op.opcode, tuple(operand_vns), ctx.get_mem_epoch())
+        else:
+            shallow_key = (op.opcode, tuple(operand_vns))
 
-        return (op.opcode, tuple(operand_vns))
+        return self._intern(shallow_key)
 
     def _get_operand_value_number(
         self,

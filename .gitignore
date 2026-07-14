@@ -3,3 +3,5 @@ trace.json
 .hypothesis
 .DS_Store
 dumps/
+# CocoIndex Code (ccc)
+/.cocoindex_code/
